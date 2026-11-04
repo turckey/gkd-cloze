@@ -87,6 +87,13 @@ h2{font-size:18px;margin-bottom:10px}
 .blank:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--pri) 22%,transparent)}
 .blank.ok{background:var(--ok-soft);border-color:var(--ok);color:var(--ok)}
 .blank.bad{background:var(--bad-soft);border-color:var(--bad);color:var(--bad);animation:shake .3s}
+.blank.near{background:var(--warn-soft);border-color:var(--warn);color:#b4791a}
+.search{width:100%;padding:11px 14px;border-radius:12px;border:1px solid var(--line);
+  background:var(--bg);color:var(--ink);font:inherit;outline:none}
+.search:focus{border-color:var(--pri)}
+.orig{font-size:16px;line-height:2;background:var(--bg);border:1px solid var(--line);
+  border-radius:12px;padding:14px}
+.orig code,code{background:var(--pri-soft);color:var(--pri);padding:1px 5px;border-radius:5px;font-size:13px}
 .blank.hinted{background:var(--warn-soft);border-color:var(--warn)}
 @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}
 .hintbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
@@ -136,6 +143,7 @@ h2{font-size:18px;margin-bottom:10px}
   <div class="brand">阶梯挖空<span class="sub" id="sampleTag">全量</span></div>
   <nav class="tabs">
     <button data-nav="home" class="active">学习</button>
+    <button data-nav="lib">原文</button>
     <button data-nav="dash">看板</button>
     <button data-nav="settings">设置</button>
   </nav>
@@ -153,42 +161,177 @@ h2{font-size:18px;margin-bottom:10px}
 <script>
 'use strict';
 const D = window.QUIZ_DATA || {items:[],meta:{}};
-const ITEMS = D.items || [];
 const WORDS = D.wordpool || {};
 const META = D.meta || {};
-const LS = 'gkd-cloze-v1';
+const LS = 'gkd-cloze-v2';
+const BUILTIN = (D.items || []).map(x => Object.assign({builtin:true}, x));
+let ITEMS = BUILTIN.slice();
 
 /* ---------------- state ---------------- */
 function defaultState(){
-  return { items:{}, log:[], streak:{last:'',n:0},
-    settings:{theme:'light', font:16, dailyNew:8,
+  return { items:{}, log:[], custom:[], streak:{last:'',n:0},
+    settings:{theme:'light', font:16, dailyNew:12, fastReview:true, knowledgeUrl:'',
       apiBase:'https://api.deepseek.com/v1', apiKey:'', model:'deepseek-chat'} };
 }
-let S = (()=>{ try{ const raw=localStorage.getItem(LS); if(raw){ const o=JSON.parse(raw); return Object.assign(defaultState(),o,{settings:Object.assign(defaultState().settings,o.settings||{})}); } }catch(e){} return defaultState(); })();
+function loadState(){
+  const base = defaultState();
+  try{
+    const raw = localStorage.getItem(LS) || localStorage.getItem('gkd-cloze-v1');
+    if(raw){
+      const o = JSON.parse(raw);
+      return {items:o.items||{}, log:o.log||[], custom:o.custom||[], streak:o.streak||{last:'',n:0},
+              settings:Object.assign(base.settings, o.settings||{})};
+    }
+  }catch(e){}
+  return base;
+}
+let S = loadState();
 function save(){ try{ localStorage.setItem(LS, JSON.stringify(S)); }catch(e){ toast('本地存储失败'); } }
-function prog(id){ if(!S.items[id]) S.items[id]={stage:0,cleared:false,rep:0,ivl:0,due:0,weak:{},seen:0}; return S.items[id]; }
+
+/* ---------------- custom items / ladder builder ---------------- */
+function hash36(str){ let h=5381; for(let i=0;i<str.length;i++){ h=((h*33)^str.charCodeAt(i))>>>0; } return h.toString(36); }
+function customKey(e){ return (e.subject||'补充')+'|'+(e.chapter||'补充')+'|'+(e.name||''); }
+
+function normText(s){
+  return String(s||'').normalize('NFKC')
+    .replace(/[\s\u3000]/g,'')
+    .replace(/[\u3000-\u303F\uFF00-\uFFEF!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]/g,'')
+    .toLowerCase();
+}
+function stripBlankChars(t){ return t.replace(/[的地得]/g,''); }
+const norm = s => stripBlankChars(normText(s));
+
+function chunkClauses(body){
+  return body.split(/(?<=[，。；：！？])/).map(s=>s.trim()).filter(Boolean);
+}
+function autoLadder(body, name){
+  // 分段挖空：把释义按标点切成 3 段，每轮挖一段里的关键词短语
+  const clauses = chunkClauses(body);
+  const segs = clauses.length ? clauses : [body];
+  const n = Math.min(3, Math.max(2, Math.ceil(segs.length/2)));
+  const stages = [];
+  const per = Math.ceil(segs.length / n);
+  for(let k=0;k<n;k++){
+    const part = segs.slice(k*per, (k+1)*per).join('');
+    // 从这一段里挑 2~4 个 2-8 字的中文短语，尽量分散
+    const cand = [];
+    const re = /[\u4e00-\u9fa5]{2,8}/g; let m;
+    while((m=re.exec(part))){
+      const w = m[0];
+      if(w.length < 2) continue;
+      if(/^(的|是|指|和|与|及|或|等|在|为|对|从|被|把|所|其|也|都|就|而|但|则|之|有|无|不|可)/.test(w)) continue;
+      cand.push({w, i:m.index});
+    }
+    if(!cand.length) continue;
+    const pick = [];
+    const step = Math.max(1, Math.floor(cand.length/4));
+    for(let i=0;i<cand.length && pick.length<4;i+=step) pick.push(cand[i]);
+    // 定位到 body 的绝对偏移
+    const base = body.indexOf(part);
+    if(base < 0) continue;
+    const blanks = [];
+    let pos = 0;
+    for(const c of pick){
+      let at = part.indexOf(c.w, pos);
+      if(at < 0) continue;
+      blanks.push({s: base+at, e: base+at+c.w.length, w: c.w});
+      pos = at + c.w.length;
+    }
+    blanks.sort((a,b)=>a.s-b.s);
+    if(!blanks.length) continue;
+    const tier = ['G1','G2','G3','G4'][k] || 'G4';
+    stages.push({kind:'cloze', tier, label:'第'+(stages.length+1)+'轮 · 分段挖空（第'+(k+1)+'段）', blanks});
+  }
+  if(!stages.length){
+    // 兜底：整段挖第一个 4~8 字短语
+    const m = body.match(/[\u4e00-\u9fa5]{4,8}/);
+    if(m){ const s = body.indexOf(m[0]); stages.push({kind:'cloze', tier:'G4', label:'第1轮 · 挖关键词', blanks:[{s, e:s+m[0].length, w:m[0]}]}); }
+  }
+  // 默写轮
+  const recSegs = [];
+  let buf='', len=0;
+  for(const cl of (clauses.length?clauses:[body])){
+    if(len + cl.length > 72 && buf){ recSegs.push(buf); buf=cl; len=cl.length; }
+    else { buf += cl; len += cl.length; }
+  }
+  if(buf) recSegs.push(buf);
+  const segments = recSegs.map(s=>{
+    let hint = '对象/结果';
+    if(/^(按照|根据|依照|依据|为了|以|通过|运用|采用|使用|在|经|由|对|针对|由于)/.test(s)) hint='状语/依据/手段';
+    else if(/^(但是|同时|因此|从而|并且|而且|或者|包括|即|所谓|是指)/.test(s)) hint='逻辑/条件';
+    else if(/(国家机关|公安机关|人民检察院|人民法院|人民警察|行为人|当事人|公民|单位)/.test(s)) hint='主体/行为';
+    return {hint, answer:s};
+  });
+  stages.push({kind:'recall', label:'最后1轮 · 只给标题默写', segments});
+  return stages;
+}
+function normalizeCustom(e, i){
+  const name = String(e.name||'未命名').trim();
+  const body = String(e.body||'').trim();
+  const subject = String(e.subject||'补充内容').trim();
+  const chapter = String(e.chapter||'导入').trim();
+  const id = e.id || ('c-' + hash36(subject+chapter+name+body));
+  const stages = (e.stages && e.stages.length) ? e.stages : autoLadder(body, name);
+  return {id, subject, chapter, name, body, chars:body.length, stages, builtin:false};
+}
+function mergeCustom(list, mode){  const existing = new Map((S.custom||[]).map(x=>[customKey(x), x]));
+  let added = 0, updated = 0;
+  for(const raw of list){
+    if(!raw || !raw.name || !raw.body) continue;
+    const k = customKey(raw);
+    if(existing.has(k)){
+      if(mode==='replace'){ existing.set(k, normalizeCustom(Object.assign({}, raw, {id: existing.get(k).id}))); updated++; }
+    } else {
+      const item = normalizeCustom(raw);
+      existing.set(k, item); added++;
+    }
+  }
+  S.custom = [...existing.values()];
+  rebuildItems();
+  save();
+  return {added, updated, total:S.custom.length};
+}
+function readKnowledgeFile(f){
+  const r = new FileReader();
+  r.onload = () => {
+    try{
+      const data = JSON.parse(r.result);
+      const list = Array.isArray(data) ? data : (data.items||data.entries||[]);
+      if(!list.length) throw new Error('没有条目');
+      const res = mergeCustom(list, 'keep');
+      toast(`已导入：新增 ${res.added} 条，共 ${res.total} 条补充内容`);
+      render();
+    }catch(e){ toast('导入失败：' + e.message); }
+  };
+  r.onerror = () => toast('读取文件失败');
+  r.readAsText(f);
+}
+function rebuildItems(){
+  ITEMS = BUILTIN.concat((S.custom||[]).map(x=>normalizeCustom(x)));
+}
+rebuildItems();
+function prog(id){ if(!S.items[id]) S.items[id]={stage:0,cleared:false,ef:2.5,rep:0,ivl:0,due:0,weak:{},seen:0,lastQ:null}; return S.items[id]; }
 
 /* ---------------- utils ---------------- */
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const PUNCT = /[，。；：、！？“”‘’（）()\s,.;:!?"'·—…《》%％]/g;
-const norm = s => String(s).replace(PUNCT,'').replace(/[的地得]/g,'').toLowerCase();
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),1800); }
 function today(){ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 function daysBetween(a,b){ return Math.round((b-a)/86400000); }
 function chapterKey(it){ return it.subject+'|'+it.chapter; }
 function chapters(){
-  const list = (META.chapters && META.chapters.length ? META.chapters : []).map(c => ({
-    key: c.subject + '|' + c.title, subject: c.subject, title: c.title, items: []
-  }));
-  if(!list.length){
-    const map = new Map();
-    ITEMS.forEach(it=>{ const k=chapterKey(it); if(!map.has(k)) map.set(k,{key:k,subject:it.subject,title:it.chapter,items:[]}); map.get(k).items.push(it); });
-    return [...map.values()];
-  }
-  const byKey = new Map(list.map(c=>[c.key, c]));
-  ITEMS.forEach(it=>{ const c = byKey.get(chapterKey(it)); if(c) c.items.push(it); });
-  return list;
+  const map = new Map();
+  ITEMS.forEach(it=>{
+    const k = chapterKey(it);
+    if(!map.has(k)) map.set(k, {key:k, subject:it.subject, title:it.chapter, items:[]});
+    map.get(k).items.push(it);
+  });
+  // 原文缺失的章节占位（META 中 0 条）
+  (META.chapters||[]).forEach(c=>{
+    const k = c.subject + '|' + c.title;
+    if(!map.has(k) && !c.count) map.set(k, {key:k, subject:c.subject, title:c.title, items:[]});
+  });
+  return [...map.values()];
 }
 function itemState(it){
   const p = S.items[it.id];
@@ -198,7 +341,8 @@ function itemState(it){
 }
 function dueItems(){
   const now = Date.now();
-  return ITEMS.filter(it=>{ const p=S.items[it.id]; return p && p.cleared && p.due && p.due<=now; });
+  return ITEMS.filter(it=>{ const p=S.items[it.id]; return p && p.cleared && p.due && p.due<=now; })
+              .sort((a,b)=>(S.items[a.id].due||0)-(S.items[b.id].due||0));
 }
 function accuracy(items){
   const log = S.log || [];
@@ -252,10 +396,12 @@ function render(){
   const app = $('#app');
   document.documentElement.setAttribute('data-theme', S.settings.theme||'light');
   const tag = $('#sampleTag');
-  if(tag) tag.textContent = (META.itemCount||ITEMS.length) + ' 条 · ' + ((META.chapters||[]).length||'') + ' 章';
+  if(tag) tag.textContent = ITEMS.length + ' 条 · ' + chapters().length + ' 章';
   if(current.screen==='home') app.innerHTML = viewHome();
   else if(current.screen==='chapter') app.innerHTML = viewChapter();
   else if(current.screen==='play') app.innerHTML = viewPlay();
+  else if(current.screen==='lib') app.innerHTML = viewLib();
+  else if(current.screen==='orig') app.innerHTML = viewOrig();
   else if(current.screen==='dash') app.innerHTML = viewDash();
   else if(current.screen==='settings') app.innerHTML = viewSettings();
   bind();
@@ -347,6 +493,59 @@ function viewChapter(){
   </div>` : '<div class="empty">这一章原文缺失，可以去其他章节或看板做薄弱强化。</div>'}`;
 }
 
+/* ---------- 原文资料库 ---------- */
+function viewLib(){
+  const q = (current.libQuery||'').trim();
+  const cs = chapters().map(c=>{
+    if(!q) return c;
+    const items = c.items.filter(it=> (it.name+' '+it.body).indexOf(q)>=0);
+    return Object.assign({}, c, {items});
+  }).filter(c=>c.items.length);
+  return `
+  <div class="card">
+    <h2 style="margin-bottom:8px">原文资料库</h2>
+    <div class="muted" style="font-size:13px;margin-bottom:10px">随时查看完整原文，不扣分、不算入学习进度。</div>
+    <input class="search" id="libSearch" placeholder="搜索名解标题或原文关键词…" value="${esc(q)}">
+  </div>
+  ${cs.length? cs.map(c=>`
+    <div class="subhead"><b>${esc(c.title)}</b><span class="muted">${esc(c.subject)} · ${c.items.length} 条</span></div>
+    ${c.items.map(it=>`<div class="chap" data-orig="${esc(it.id)}">
+      <div class="info"><div class="name">${esc(it.name)}</div>
+      <div class="meta">${it.chars} 字 · ${it.stages.length} 轮</div></div>
+      <div class="pct">原文 →</div>
+    </div>`).join('')}
+  `).join('') : '<div class="empty">没有匹配的内容</div>'}`;
+}
+function viewOrig(){
+  const it = ITEMS.find(x=>x.id===current.origId);
+  if(!it) return '<div class="empty">条目不存在</div>';
+  const p = S.items[it.id];
+  const dueTxt = p && p.due ? nextReviewText(p) : '未开始';
+  return `
+  <div class="row" style="align-items:center;margin-bottom:10px">
+    <button class="btn small ghost" data-nav="lib">← 原文库</button>
+    <div class="muted grow" style="text-align:right;font-size:13px">${esc(it.chapter)}</div>
+  </div>
+  <div class="card">
+    <div class="muted" style="font-size:12px">${esc(it.subject)} · 名解</div>
+    <h2 style="margin:2px 0 10px">${esc(it.name)}</h2>
+    <div class="orig">${esc(it.body)}</div>
+    <div class="row" style="margin-top:12px;align-items:center">
+      <div class="muted" style="font-size:13px">${it.chars} 字 · ${it.stages.length} 轮 · ${esc(dueTxt)}</div>
+      <div class="grow"></div>
+      <button class="btn primary" data-action="studyThis" data-id="${esc(it.id)}">开始 / 继续学 →</button>
+    </div>
+  </div>
+  <div class="card">
+    <h2>分段记忆（默写提示）</h2>
+    ${it.stages.filter(s=>s.kind==='recall')[0].segments.map((s,i)=>`
+      <div style="margin-bottom:10px">
+        <div class="muted" style="font-size:12px">第 ${i+1} 段 · ${esc(s.hint)}</div>
+        <div class="orig" style="margin-top:4px">${esc(s.answer)}</div>
+      </div>`).join('')}
+  </div>`;
+}
+
 /* ---------- play ---------- */
 function pickStartStage(it){
   const p = prog(it.id);
@@ -357,10 +556,12 @@ function pickStartStage(it){
 function startItem(id, opts){
   const it = ITEMS.find(x=>x.id===id);
   if(!it) return;
-  const p = prog(it.id);
   const review = !!(opts&&opts.review);
   current.play = {it, idx: pickStartStage(it), review, attempt:0, hints:0, t0:Date.now(), done:false};
-  if(review) current.play.idx = 0;
+  if(review){
+    // 快速复习：跳过前几轮，直接从最后 1 个挖空轮进入默写
+    current.play.idx = (S.settings.fastReview && it.stages.length > 2) ? it.stages.length - 2 : 0;
+  }
   current.screen = 'play';
   render();
 }
@@ -407,6 +608,7 @@ function viewPlay(){
     </div>
     ${st.kind==='cloze' ? '<div class="muted" style="font-size:12px;margin-top:10px">提示：Tab / Enter 跳到下一个空，回车可提交检查。</div>' : ''}
     <div class="row" style="margin-top:10px">
+      <button class="btn small ghost" data-action="peek">查看原文</button>
       <button class="btn small ghost" data-action="aiExplain">AI 拆解这条</button>
     </div>
   </div>
@@ -434,6 +636,27 @@ function renderRecall(it, st){
 }
 
 /* ---------- checking ---------- */
+function lev(a,b){
+  a=String(a); b=String(b);
+  if(a===b) return 0;
+  const m=a.length, n=b.length;
+  if(!m) return n; if(!n) return m;
+  let prev = Array.from({length:n+1},(_,j)=>j);
+  for(let i=1;i<=m;i++){
+    const cur=[i];
+    for(let j=1;j<=n;j++){
+      cur[j] = Math.min(prev[j]+1, cur[j-1]+1, prev[j-1] + (a[i-1]===b[j-1]?0:1));
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+function nearEnough(input, want){
+  const a=norm(input), b=norm(want);
+  if(a===b) return 'exact';
+  if(b.length >= 4 && a.length >= 3 && lev(a,b) <= 1) return 'near';
+  return null;
+}
 function checkCloze(){
   const P=current.play; const it=P.it; const st=it.stages[P.idx];
   const inputs=[...document.querySelectorAll('.blank')];
@@ -444,8 +667,9 @@ function checkCloze(){
   let ok=0, wrongIdx=[];
   inputs.forEach((inp,i)=>{
     const want=st.blanks[i].w;
-    if(norm(inp.value)===norm(want)){
-      inp.classList.add('ok'); inp.classList.remove('bad'); inp.readOnly=true; ok++;
+    const r = nearEnough(inp.value, want);
+    if(r){
+      inp.classList.add(r==='near'?'near':'ok'); inp.classList.remove('bad'); inp.readOnly=true; ok++;
     }else{
       inp.classList.add('bad'); wrongIdx.push(i);
     }
@@ -538,19 +762,21 @@ function submitRecall(){
     const user = areas[i].value;
     const A = norm(s.answer), B = norm(user);
     totLen += A.length;
-    if(!B.length) return {i, user, ok:0, answer:s.answer, matched:new Set()};
+    if(!B.length) return {i, user, ok:0, answer:s.answer, matched:new Set(), extra:0};
     const r = lcsMatch(A,B);
     totMatch += r.len;
-    // matched positions in answer chars (after norm) -> map back roughly to raw answer
-    return {i, user, ok:r.len, answer:s.answer, matched:r.matched};
+    return {i, user, ok:r.len, answer:s.answer, matched:r.matched, extra: Math.max(0, B.length - r.len)};
   });
   const pct = totLen? Math.round(totMatch/totLen*100):0;
   const fb=$('#fbZone');
+  // 标点/空格在比对前已忽略，多打的标点不会产生连锁错误
   const detail = rows.map(r=>{
     const A=norm(r.answer);
     let html='';
     for(let k=0;k<A.length;k++){ html += r.matched.has(k)? esc(A[k]) : `<mark>${esc(A[k])}</mark>`; }
-    return `<div style="margin-bottom:10px"><div class="muted" style="font-size:12px">第 ${r.i+1} 段 · 你写了 ${r.user.length} 字</div>
+    const segPct = A.length? Math.round(r.ok/A.length*100):0;
+    return `<div style="margin-bottom:10px">
+      <div class="muted" style="font-size:12px">第 ${r.i+1} 段 · 命中 ${segPct}%${r.extra?` · 多写/顺序不同 ${r.extra} 字（已忽略）`:''}</div>
       <div class="diff">${html||'<span class="muted">（空）</span>'}</div></div>`;
   }).join('');
   const q = pct>=95?5:pct>=85?4:pct>=70?3:pct>=50?2:1;
@@ -560,28 +786,46 @@ function submitRecall(){
   p.seen=(p.seen||0)+1;
   schedule(it, q);
   save();
+  const nv = nextReviewText(p);
   fb.innerHTML = `<div class="fb">
     <div class="line">
       <div class="score ${pct>=70?'ok':'bad'}">默写命中 ${pct}%</div>
-      <div class="muted" style="font-size:13px">红色为缺失/写错的字</div>
+      <div class="muted" style="font-size:13px">红色为缺失/写错的字 · 标点不计</div>
       <div class="grow"></div>
       <button class="btn" data-action="retryRecall">再默一遍</button>
       <button class="btn primary" data-action="finishItem">完成本条 →</button>
     </div>
+    <div class="muted" style="font-size:12px;margin-top:6px">下次复习：${esc(nv)}</div>
     <div style="margin-top:12px">${detail}</div>
     <div class="row" style="margin-top:4px"><button class="btn small ghost" data-action="aiGradeRecall">AI 批改这段默写</button></div>
   </div>`;
   bindFb();
 }
 
-/* ---------- srs ---------- */
+/* ---------- srs（SM-2） ---------- */
 function schedule(it, q){
   const p = prog(it.id);
   q = (q==null) ? (p.lastQ!=null?p.lastQ:4) : q;
-  if(q<3){ p.rep=0; p.ivl=1; }
-  else{ p.rep=(p.rep||0)+1; const seq=[1,3,7,15,30,60]; p.ivl=seq[Math.min(p.rep-1,seq.length-1)]; }
-  p.lastQ=q;
+  let ef = p.ef || 2.5;
+  ef = Math.max(1.3, ef + (0.1 - (5-q)*(0.08 + (5-q)*0.02)));
+  p.ef = Math.round(ef*100)/100;
+  if(q < 3){ p.rep = 0; p.ivl = 1; }
+  else {
+    p.rep = (p.rep||0) + 1;
+    if(p.rep === 1) p.ivl = 1;
+    else if(p.rep === 2) p.ivl = 3;
+    else p.ivl = Math.max(1, Math.round((p.ivl||1) * p.ef));
+  }
+  p.lastQ = q;
+  p.reviewed = (p.reviewed||0) + 1;
   p.due = Date.now() + p.ivl*86400000;
+}
+function nextReviewText(p){
+  if(!p || !p.due) return '未开始';
+  const ms = p.due - Date.now();
+  if(ms <= 0) return '今天到期（建议复习）';
+  const d = Math.ceil(ms/86400000);
+  return d + ' 天后复习';
 }
 function logResult(it, stageIdx, ok, hints, sec, tier, q){
   S.log.push({id:it.id, ts:Date.now(), stage:stageIdx, ok:ok?1:0, hints:hints||0, sec:sec||0, tier:tier||'', q:q||0});
@@ -647,6 +891,22 @@ function viewDash(){
     </div>`).join('')}
   </div>
   <div class="card" style="margin-top:14px">
+    <h2>记忆强度分布</h2>
+    ${(()=>{
+      const buckets=[['≤1天',0],['3天',0],['7天',0],['15天',0],['30天+',0],['到期',0]];
+      ITEMS.forEach(it=>{ const p=S.items[it.id]; if(!p||!p.cleared||!p.due) return;
+        if(p.due<=Date.now()) buckets[5][1]++;
+        else { const d=(p.due-Date.now())/86400000; if(d<=1.5) buckets[0][1]++; else if(d<=4) buckets[1][1]++; else if(d<=9) buckets[2][1]++; else if(d<=20) buckets[3][1]++; else buckets[4][1]++; }
+      });
+      const max=Math.max(1,...buckets.map(b=>b[1]));
+      return buckets.map(b=>`<div class="row" style="align-items:center;gap:10px;margin-bottom:8px">
+        <div class="muted" style="width:56px;font-size:12px">${b[0]}</div>
+        <div class="bar grow" style="height:12px"><i style="width:${Math.round(b[1]/max*100)}%"></i></div>
+        <div style="width:40px;text-align:right;font-size:12px">${b[1]}</div></div>`).join('');
+    })()}
+    <div class="muted" style="font-size:12px">间隔越长说明记得越牢；"到期"越多说明该复习了。</div>
+  </div>
+  <div class="card" style="margin-top:14px">
     <h2>记忆曲线 · 近 7 日正确率</h2>
     ${pts.length? `<svg class="spark" viewBox="0 0 280 96" preserveAspectRatio="none">
       <line x1="20" y1="20" x2="260" y2="20" stroke="var(--line)" stroke-width="1"/>
@@ -710,12 +970,37 @@ function viewSettings(){
     <div class="setting"><div class="lab">模型名</div><input type="text" value="${esc(st.model)}" data-set="model"></div>
   </div>
   <div class="card">
+    <h2>知识库 · 导入 / 更新</h2>
+    <div class="muted" style="font-size:13px;margin-bottom:8px">
+      支持 JSON（<code>{"items":[{"subject":"…","chapter":"…","name":"…","body":"…"}]}</code> 或直接数组）。
+      新增条目会自动生成分段挖空 + 默写阶梯；同名的会跳过，不覆盖你已有进度。
+    </div>
+    <div class="setting"><div class="lab">当前补充内容</div><b>${(S.custom||[]).length} 条</b></div>
+    <div class="setting"><div class="lab">从文件导入 JSON</div>
+      <button class="btn small soft" data-action="importKnowledge">选择文件</button></div>
+    <div class="setting"><div class="lab">从本机更新（输入地址）</div>
+      <input type="text" placeholder="http://192.168.x.x:8899/data.json" value="${esc(st.knowledgeUrl||'')}" data-set="knowledgeUrl"></div>
+    <div class="row" style="margin:8px 0">
+      <button class="btn small soft" data-action="pullKnowledge">立即从本机拉取</button>
+      <button class="btn small ghost" data-action="historyOfUpdate" style="font-size:12px">怎么用？</button>
+    </div>
+    <div class="muted" style="font-size:12px">用法：电脑双击「启动知识更新服务.bat」→ 把窗口里的地址粘到上面 → 点"立即从本机拉取"。手机需和电脑同一 Wi-Fi。</div>
+  </div>
+  <div class="card">
+    <h2>复习设置</h2>
+    <div class="setting"><div class="lab">快速复习（复习时只做最后 1 挖空轮 + 默写）</div>
+      <button class="btn small ${st.fastReview?'primary':'ghost'}" data-action="toggleFast">${st.fastReview?'已开启':'已关闭'}</button></div>
+    <div class="setting"><div class="lab">每日新题量</div>
+      <input type="number" min="1" max="200" value="${st.dailyNew}" data-set="dailyNew"></div>
+    <div class="muted" style="font-size:12px">记忆算法：SM-2（间隔 1 天 → 3 天 → 按记忆强度递增；答错率高的条目会更早回来）。</div>
+  </div>
+  <div class="card">
     <h2>数据</h2>
-    <div class="setting"><div class="lab">导出进度备份</div><button class="btn small soft" data-action="export">导出 JSON</button></div>
-    <div class="setting"><div class="lab">导入进度备份</div><button class="btn small ghost" data-action="import">选择文件</button></div>
+    <div class="setting"><div class="lab">导出备份（含进度 + 导入内容）</div><button class="btn small soft" data-action="export">导出 JSON</button></div>
+    <div class="setting"><div class="lab">导入备份</div><button class="btn small ghost" data-action="import">选择文件</button></div>
     <div class="setting"><div class="lab">清空所有进度</div><button class="btn small danger" data-action="reset">重置</button></div>
   </div>
-  <div class="footer-note">M1 样张 · 数据来源《冲刺必背上的名解》PDF · 本地离线运行</div>`;
+  <div class="footer-note">${ITEMS.length} 条内容 · 数据来源《冲刺必背上的名解》· 本地离线运行</div>`;
 }
 
 /* ---------- binding ---------- */
@@ -723,6 +1008,17 @@ function bind(){
   document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>setScreen(b.dataset.nav));
   document.querySelectorAll('[data-chapter]').forEach(el=>el.onclick=()=>{ current.chapter=el.dataset.chapter; current.screen='chapter'; render(); });
   document.querySelectorAll('[data-item]').forEach(el=>el.onclick=()=>startItem(el.dataset.item));
+  document.querySelectorAll('[data-orig]').forEach(el=>el.onclick=()=>{ current.origId=el.dataset.orig; current.screen='orig'; render(); });
+  const libSearch = $('#libSearch');
+  if(libSearch){
+    libSearch.oninput = () => {
+      const pos = libSearch.selectionStart;
+      current.libQuery = libSearch.value;
+      render();
+      const again = $('#libSearch');
+      if(again){ again.focus(); try{ again.setSelectionRange(pos,pos); }catch(e){} }
+    };
+  }
   document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>action(b.dataset.action, b));
   document.querySelectorAll('[data-hint]').forEach(b=>b.onclick=()=>hint(b.dataset.hint, b));
   document.querySelectorAll('[data-set]').forEach(inp=>inp.onchange=()=>{
@@ -770,6 +1066,12 @@ function action(name, btn){
       if(!q.length){ toast('还没有错题记录'); break; }
       startQueue(q); break; }
     case 'quit': current.queue=[]; current.play=null; current.screen='home'; render(); break;
+    case 'peek': {
+      if(!P) break;
+      P.hints++;
+      openModal('原文 · '+P.it.name, '<div class="orig" style="font-size:16px;line-height:2">'+esc(P.it.body)+'</div>');
+      break; }
+    case 'studyThis': { const id=btn&&btn.dataset.id; if(id) startItem(id); break; }
     case 'check': checkCloze(); break;
     case 'reveal': showAnswer(); break;
     case 'nextStage': nextStage(); break;
@@ -781,15 +1083,41 @@ function action(name, btn){
     case 'aiGradeRecall': aiGradeRecall(); break;
     case 'aiWeak': aiWeak(); break;
     case 'toggleTheme': S.settings.theme = S.settings.theme==='dark'?'light':'dark'; save(); render(); break;
+    case 'toggleFast': S.settings.fastReview = !S.settings.fastReview; save(); render(); break;
+    case 'importKnowledge': {
+      const inp=document.createElement('input'); inp.type='file'; inp.accept='.json,application/json';
+      inp.onchange=()=>{ const f=inp.files[0]; if(!f) return; readKnowledgeFile(f); };
+      inp.click(); break; }
+    case 'pullKnowledge': {
+      const url = (S.settings.knowledgeUrl||'').trim();
+      if(!url){ toast('先在设置里填本机地址'); break; }
+      toast('正在从本机拉取…');
+      fetch(url, {cache:'no-store'})
+        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .then(data=>{
+          const list = Array.isArray(data) ? data : (data.items||data.entries||[]);
+          if(!list.length) throw new Error('没有条目');
+          const res = mergeCustom(list, 'keep');
+          toast(`更新完成：新增 ${res.added} 条，共 ${res.total} 条补充内容`);
+          render();
+        })
+        .catch(e=>toast('连接失败：'+e.message));
+      break; }
+    case 'historyOfUpdate': openModal('怎么从本机更新内容', `<div class="orig" style="font-size:14px;line-height:1.9">
+1. 电脑上双击项目里的「启动知识更新服务.bat」，会显示类似 http://192.168.1.5:8899/data.json 的地址。<br>
+2. 手机连同一个 Wi-Fi，把这个地址填进设置里的输入框，点「立即从本机拉取」。<br>
+3. 电脑上更新 knowledge\\data.json（格式见下）后，手机再点一次即可增量导入。<br><br>
+格式：<br><code>{"items":[{"subject":"刑法学","chapter":"补充","name":"名解名称","body":"完整释义"}]}</code><br>
+也可以直接是数组，或把 新名解.txt（每行：名称&lt;TAB&gt;释义）用 tools\\make_knowledge_json.py 转换。</div>`); break;
     case 'export': {
       const blob=new Blob([JSON.stringify(S,null,1)],{type:'application/json'});
       const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='gkd-cloze-backup.json'; a.click(); toast('已导出'); break; }
     case 'import': {
       const inp=document.createElement('input'); inp.type='file'; inp.accept='.json';
       inp.onchange=()=>{ const f=inp.files[0]; if(!f) return; const r=new FileReader();
-        r.onload=()=>{ try{ const o=JSON.parse(r.result); S=Object.assign(defaultState(),o,{settings:Object.assign(defaultState().settings,o.settings||{})}); save(); toast('导入成功'); render(); }catch(e){ toast('文件格式不对'); } }; r.readAsText(f); };
+        r.onload=()=>{ try{ const o=JSON.parse(r.result); S=Object.assign(defaultState(),o,{settings:Object.assign(defaultState().settings,o.settings||{})}); rebuildItems(); save(); toast('导入成功'); render(); }catch(e){ toast('文件格式不对'); } }; r.readAsText(f); };
       inp.click(); break; }
-    case 'reset': if(confirm('确定清空所有进度和记录？')){ S=defaultState(); save(); render(); toast('已重置'); } break;
+    case 'reset': if(confirm('确定清空所有进度、记录和导入的内容？')){ S=defaultState(); rebuildItems(); save(); current.queue=[]; render(); toast('已重置'); } break;
   }
 }
 
