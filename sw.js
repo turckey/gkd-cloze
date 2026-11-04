@@ -1,7 +1,7 @@
-/* 公大名解 · 阶梯挖空 — offline service worker
+﻿/* 鍏ぇ鍚嶈В 路 闃舵鎸栫┖ 鈥?offline service worker
    Strategy: network-first with cache fallback, so a redeploy shows up immediately
    when online, while offline still works from cache. */
-const CACHE = 'gkd-cloze-v3';
+const CACHE = 'gkd-cloze-v4';
 const ASSETS = [
   './index.html',
   './data.js',
